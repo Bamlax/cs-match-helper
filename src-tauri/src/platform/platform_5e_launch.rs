@@ -50,6 +50,38 @@ enum PortState {
     Occupied,
 }
 
+#[cfg(windows)]
+fn detect_client_root_from_process() -> Option<PathBuf> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    
+    if let Ok(output) = std::process::Command::new("wmic")
+        .args(["process", "where", "name='5EClient.exe'", "get", "ExecutablePath"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.contains("ExecutablePath") {
+                continue;
+            }
+            let exe_path = PathBuf::from(trimmed);
+            if let Some(parent) = exe_path.parent() {
+                if is_valid_root(parent) {
+                    return Some(parent.to_path_buf());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn detect_client_root_from_process() -> Option<PathBuf> {
+    None
+}
+
 pub fn detect_client_root(hint: Option<&str>) -> Result<PathBuf, String> {
     if let Some(h) = hint {
         let path = PathBuf::from(h);
@@ -57,6 +89,18 @@ pub fn detect_client_root(hint: Option<&str>) -> Result<PathBuf, String> {
             return Ok(path);
         }
         return Err(format!("指定的 5E 目录无效: {h}"));
+    }
+
+    if let Some(path) = detect_client_root_from_process() {
+        if is_valid_root(&path) {
+            return Ok(path);
+        }
+    }
+
+    if let Some(path) = detect_client_root_from_registry() {
+        if is_valid_root(&path) {
+            return Ok(path);
+        }
     }
 
     for root in DEFAULT_ROOTS {
@@ -67,6 +111,58 @@ pub fn detect_client_root(hint: Option<&str>) -> Result<PathBuf, String> {
     }
 
     Err("未找到 5E 客户端，请确认已正确安装".to_string())
+}
+
+#[cfg(windows)]
+fn detect_client_root_from_registry() -> Option<PathBuf> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+
+    let subkeys = [
+        (hklm.clone(), "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\5EClient"),
+        (hklm.clone(), "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\5EClient"),
+        (hkcu.clone(), "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\5EClient"),
+        // 尝试一些可能的5e自己的注册表路径
+        (hkcu.clone(), "Software\\5E\\5EClient"),
+        (hklm.clone(), "SOFTWARE\\5E\\5EClient"),
+    ];
+
+    for (hkey, subkey_path) in subkeys.into_iter() {
+        if let Ok(key) = hkey.open_subkey_with_flags(subkey_path, KEY_READ) {
+            if let Ok(install_location) = key.get_value::<String, _>("InstallLocation") {
+                let path = PathBuf::from(install_location.trim_matches('"'));
+                if is_valid_root(&path) {
+                    return Some(path);
+                }
+            }
+            if let Ok(display_icon) = key.get_value::<String, _>("DisplayIcon") {
+                let path_str = display_icon.trim_matches('"').split(',').next().unwrap_or("");
+                let exe_path = PathBuf::from(path_str);
+                if let Some(parent) = exe_path.parent() {
+                    if is_valid_root(parent) {
+                        return Some(parent.to_path_buf());
+                    }
+                }
+            }
+            if let Ok(exe_path_str) = key.get_value::<String, _>("Executable") {
+                let exe_path = PathBuf::from(exe_path_str.trim_matches('"'));
+                if let Some(parent) = exe_path.parent() {
+                    if is_valid_root(parent) {
+                        return Some(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn detect_client_root_from_registry() -> Option<PathBuf> {
+    None
 }
 
 fn is_valid_root(root: &Path) -> bool {
